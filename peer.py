@@ -1,48 +1,25 @@
 import asyncio
-import json
-import sys
+
+from uuid import uuid4
 
 
-class DummyPeer(asyncio.Protocol):
+class RaftPeer(object):
+    def __init__(self, host, port, peer_id=None):
+        self.host = host
+        self.port = port
+        self.peer_id = peer_id or uuid4()
 
-    def decode(self, data):
-        return json.loads(data.decode())
+        self.current = 0
+        self.next = 0
 
-    def encode(self, data):
-        return json.dumps(data).encode()
+        self._stream = None
 
-    def connection_made(self, transport):
-        peername = transport.get_extra_info('peername')
-        print('Connection from {}'.format(peername))
-        self.transport = transport
+    @asyncio.coroutine
+    def stream(self):
+        if self._stream is None:
+            try:
+                self._stream = yield from asyncio.open_connection(self.host, self.port)
+            except ConnectionRefusedError:
+                return None
 
-    def data_received(self, data):
-        request = self.decode(data)
-        print('Request received: {!r}'.format(request))
-
-        response = {'cmd': 'vote', 'term': request['term'], 'granted': True}
-        print('Send: {!r}'.format(response))
-        self.transport.write(self.encode(response))
-
-        # print('Close the client socket')
-        # self.transport.close()
-
-
-def run(host, port):
-    loop = asyncio.get_event_loop()
-    coro = loop.create_server(DummyPeer, host, port)
-    server = loop.run_until_complete(coro)
-
-    print('Serving on {}'.format(server.sockets[0].getsockname()))
-    try:
-        loop.run_forever()
-    except KeyboardInterrupt:
-        pass
-
-    server.close()
-    loop.run_until_complete(server.wait_closed())
-    loop.close()
-
-
-if __name__ == '__main__':
-    run(*sys.argv[1:])
+        return self._stream

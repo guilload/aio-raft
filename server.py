@@ -1,11 +1,17 @@
 import asyncio
 import json
-import random
+import logging
 import sys
-import time
 
 from enum import Enum
+from random import randint
 from uuid import uuid4
+
+from log import RaftLog
+from peer import RaftPeer
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class State(Enum):
@@ -14,19 +20,24 @@ class State(Enum):
     CANDIDATE = 'Candidate'
 
 
-class Raft(object):
+class RaftServer(object):
 
-    def __init__(self, loop, peers, heartbeat_interval=1):
-        self.loop = loop
+    def __init__(self, peers):
+        self.loop = asyncio.get_event_loop()
 
-        self.peers = peers
-        self.streams = {}
+        self.peers = {}
 
-        self.heartbeat_interval = heartbeat_interval
-        self.last_heartbeat = loop.time()
+        for host, port in peers:
+            peer = RaftPeer(host, port)
+            self.peers[peer.peer_id] = peer
 
-        self.commit = 0
-        self.log = []
+        # heartbeat constants and bookkeeping variables
+        self.interval = 1
+        self.timeout = randint(2, 4)
+        self.last_heartbeat = self.loop.time()
+        self.last_interval = self.loop.time() - self.interval
+
+        self.log = RaftLog()
         self.state = State.FOLLOWER
         self.term = 0
         self.uuid = uuid4().hex
@@ -39,16 +50,8 @@ class Raft(object):
                          'request_vote_resp': self.handle_request_vote_resp}
 
     @property
-    def leader(self):
-        return self.state == State.LEADER
-
-    @property
-    def follower(self):
-        return self.state == State.FOLLOWER
-
-    @property
     def stale(self):
-        return self.last_heartbeat + self.heartbeat_interval < self.loop.time()
+        return self.last_heartbeat + self.timeout < self.loop.time()
 
     @staticmethod
     def decode(data):
@@ -60,94 +63,103 @@ class Raft(object):
 
     @asyncio.coroutine
     def run(self):
-        yield from asyncio.sleep(2)
-
         while True:
-            start = self.loop.time()
+            print(self.state, self.term, self.stale)
 
-            if self.leader:
+            if self.state == State.LEADER:
                 self.append_entries()
 
-            if self.follower and self.stale:
+            if self.state in (State.CANDIDATE, State.FOLLOWER) and self.stale:
                 self.request_vote()
 
-            end = self.loop.time()
-            yield from asyncio.sleep()
+            yield from self.sleep()
 
-    def broadcast(self, request):
-        for peer in self.peers:
+    @asyncio.coroutine
+    def sleep(self):
+        """
+        Sleeps until the next interval.
+        """
+        delay = self.interval - self.loop.time() + self.last_interval
+        yield from asyncio.sleep(delay)
+
+        self.last_interval = self.loop.time()
+
+    def broadcast(self, request, delay=0):
+        for peer in self.peers.values():
             asyncio.async(self.send(peer, request))
 
     def append_entries(self):
+        """
+        Append entries RPC.
+        """
         request = {'rpc': 'append_entries_req',
                    'peer_id': self.uuid,
                    'term': self.term,
-                   'commit': self.commit,
-                   'entries': ['foo', 'bar'],
-                   'log_index': 0,
-                   'log_term': 0,
+                   'commit': self.log.commit,
+                   'entries': [],
+                   'log_index': self.log.index,
+                   'log_term': self.log.term,
                    }
 
         self.broadcast(request)
 
     def request_vote(self):
+        self.last_heartbeat = self.loop.time()
         self.state = State.CANDIDATE
         self.term += 1
+        self.timeout = randint(150, 300) / 1000
         self.voted = self.uuid
         self.votes = set([self.uuid])
 
         request = {'rpc': 'request_vote_req',
                    'peer_id': self.uuid,
                    'term': self.term,
-                   'log_index': 0,
-                   'log_term': 0,
+                   'log_index': self.log.index,
+                   'log_term': self.log.term,
                    }
 
-        # yield from asyncio.sleep(random.randint())
         self.broadcast(request)
 
     @asyncio.coroutine
-    def get_stream(self, peer):
-        if peer in self.streams:
-            stream = self.streams[peer]
-        else:
-            stream = yield from asyncio.open_connection(*peer, loop=self.loop)
-            self.streams[peer] = stream
-
-        return stream
-
-    @asyncio.coroutine
     def send(self, peer, request):
-        reader, writer = yield from self.get_stream(peer)
-        writer.write(self.encode(request))
+        stream = yield from peer.stream()
 
-        data = yield from reader.read(4096)  # FIXME
-        response = self.decode(data)
+        if stream is not None:
+            reader, writer = stream
+            writer.write(self.encode(request))
 
-        self.handle(response)
+            data = yield from reader.read(4096)  # FIXME see http://bugs.python.org/issue20154
+            response = self.decode(data)
+
+            self.handle(response)
 
     def handle(self, response):
-        rpc = response['rpc']
-        return self.handlers[rpc](response)
+        LOGGER.debug('Response received: {}'.format(response))
+
+        if self.term < response['term']:
+            self.to_follower(response['term'])
+
+        return self.handlers[response['rpc']](response)
+
+    def to_follower(self, term):
+        self.state = State.FOLLOWER
+        self.term = term
+        self.voted = None
+        self.votes = set()
 
     def handle_append_entries_req(self, request):
-        term = response['term']
-
-        if self.candidate and self.term < term:
-            self.state = State.FOLLOWER
-            self.term = term
-            self.voted = None
-            self.votes = set()
-
-        if term < self.term:
+        if request['term'] < self.term:
             success = False
 
-        elif self.log and self.log[request['log_entry']]['term'] != request['log_term']:
+        elif not self.log.match(request['log_index'], request['log_term']):
             success = False
 
         else:
             success = True
+            self.log.append(request['entries'])
             self.last_heartbeat = self.loop.time()
+            # if request['commit'] > self.log.commit:
+            #     self.log.commit = min(request['commit'], request['entries'][-1)
 
         return {'rpc': 'append_entries_resp',
                 'peer_id': self.uuid,
@@ -163,17 +175,18 @@ class Raft(object):
         if request['term'] < self.term:
             granted = False
 
-        elif False:  # FIXME invalid log case
-            granted = False
-
-        else:
+        elif self.voted in (None, request['peer_id']) and self.log.match(request['log_index'],
+                                                                         request['log_term']):
             granted = True
             self.last_heartbeat = self.loop.time()
+
+        else:
+            granted = False
 
         return {'rpc': 'request_vote_resp',
                 'peer_id': self.uuid,
                 'term': self.term,
-                'granted': granted,
+                'granted': granted
                 }
 
     def handle_request_vote_resp(self, response):
@@ -197,6 +210,11 @@ class RaftProtocol(asyncio.Protocol):
 
     def data_received(self, data):
         request = self.server.decode(data)
+
+        term = request['term']
+        if self.server.term < term:
+            self.server.to_follower(term)
+
         response = self.server.handle(request)
         self.transport.write(self.server.encode(response))
 
@@ -204,7 +222,7 @@ class RaftProtocol(asyncio.Protocol):
 def run(port, ports):
     loop = asyncio.get_event_loop()
     peers = [('localhost', port) for port in ports]
-    raft = Raft(loop, peers)
+    raft = RaftServer(peers)
     server = loop.create_server(lambda: RaftProtocol(raft), 'localhost', port)
     coroutines = asyncio.gather(raft.run(), server)
 
@@ -220,5 +238,4 @@ def run(port, ports):
 
 if __name__ == '__main__':
     port, *ports = map(int, sys.argv[1:])
-    time.sleep(2)
     run(port, ports)
