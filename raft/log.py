@@ -1,4 +1,4 @@
-class RaftLog(object):
+class Log(object):
 
     def __init__(self):
         self.applied = 0
