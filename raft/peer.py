@@ -10,7 +10,7 @@ class Peer(object):
         self.port = port
         self.peer_id = uuid4()
 
-        self.current = 0
+        self.match = 0
         self.next = 0
 
         self._loop = asyncio.get_event_loop()
@@ -24,9 +24,9 @@ class Peer(object):
             args = (factory, self.host, self.port)
 
             try:
-                transport, _ = yield from self._loop.create_connection(*args)
+                (transport, _) = yield from self._loop.create_connection(*args)
             except ConnectionRefusedError:
-                return None
+                return
 
             self._transport = transport
 
