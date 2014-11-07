@@ -2,52 +2,36 @@ import asyncio
 
 from uuid import uuid4
 
+from protocols import PeerProtocol
+
 
 class Peer(object):
 
     def __init__(self, server, host, port):
         self.host = host
         self.port = port
-        self.peer_id = uuid4()
+        self.peer_id = '{}:{}'.format(host, port)
 
-        self.current = 0
+        self.match = -1
         self.next = 0
+        self.transport = None
+        self.up = False
 
         self._loop = asyncio.get_event_loop()
+        self._create_conn = self._loop.create_connection  # pep8... see below
         self._server = server
-        self._transport = None
 
     @asyncio.coroutine
-    def transport(self):
-        if self._transport is None:
+    def get_transport(self):
+        if self.transport is None:
             factory = lambda: PeerProtocol(self, self._server)
-            args = (factory, self.host, self.port)
+            args = factory, self.host, self.port
 
             try:
-                transport, _ = yield from self._loop.create_connection(*args)
+                self.transport, _ = yield from self._create_conn(*args)
             except ConnectionRefusedError:
-                return None
+                return
 
-            self._transport = transport
+            self.up = True
 
-        return self._transport
-
-
-class PeerProtocol(asyncio.Protocol):
-
-    def __init__(self, peer, server):
-        self.peer = peer
-        self.server = server
-
-    def connection_made(self, transport):
-        self.transport = transport
-
-    def connection_lost(self, exc):
-        self.peer._transport = None
-
-    def data_received(self, data):
-        request = self.server.decode(data)
-        response = self.server.handle(request)
-
-        if response:
-            self.transport.write(self.server.encode(response))
+        return self.transport
