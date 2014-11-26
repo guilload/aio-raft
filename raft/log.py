@@ -1,8 +1,10 @@
 class Log(object):
 
-    def __init__(self):
-        self._applied = -1
-        self._commit = -1
+    def __init__(self, machine):
+        self.applied = -1
+        self.commit = -1
+        self.machine = machine
+
         self._entries = []  # entries are tuples (index, term, cmd)
 
     def __getitem__(self, key):
@@ -14,19 +16,17 @@ class Log(object):
     def __len__(self):
         return len(self._entries)
 
-    @property
-    def commit(self):
-        return self._commit
+    def apply(self, commit):
+        results = []
 
-    @commit.setter
-    def commit(self, value):
-        assert self._commit < value
+        while self.applied < commit:
+            self.applied += 1
+            index, term, cmd = self[self.applied]
+            result = self.machine.apply(cmd)
 
-        self._commit = value
+            results.append((term, index, result))
 
-        while self._applied < self._commit:
-            self._applied += 1
-            self.apply(self._applied)
+        return results
 
     @property
     def index(self):
@@ -45,9 +45,6 @@ class Log(object):
 
         self._entries = self._entries[:start + 1]
         self._entries.extend(entries)
-
-    def apply(self, index):
-        pass
 
     def match(self, index, term):
         try:

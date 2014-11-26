@@ -8,6 +8,7 @@ from random import randint
 from uuid import uuid4
 
 from log import Log
+from machine import Machine
 from pool import Pool
 from protocols import ClientProtocol, ServerProtocol
 
@@ -41,11 +42,13 @@ class Server(object):
         self.reset_heartbeat()
         self.reset_timeout()
 
-        self._log = Log()
+        self._log = Log(Machine())
         self.state = State.FOLLOWER
         self.term = 0
         self.voted = None
         self.votes = set()
+
+        self._pending_clients = {}
 
         self.handlers = {'append_entries_req': self.handle_append_entries_req,
                          'append_entries_resp': self.handle_append_entries_resp,
@@ -214,7 +217,9 @@ class Server(object):
 
         log_commit = request['log_commit']
         if self._log.commit < log_commit:
-            self._log.commit = min(self._log.index, log_commit)
+            index = min(self._log.index, log_commit)
+            self._log.commit = index
+            self._log.apply(index)
 
         if not log_entries:  # no need to answer, the peer might have committed
             return  # new entries but has certainly not replicated new ones
@@ -239,9 +244,11 @@ class Server(object):
             self._pool[peer_id].next = log_index + 1
 
             if (self._log.commit < log_index and
-                self._pool.ack(log_index) and
-                log_term == self.term):
+                self._pool.ack(log_index) and log_term == self.term):
                 self._log.commit = log_index
+                results = self._log.apply(log_index)
+                self.return_results(results)
+
         else:
             peer = self._pool[response['peer_id']]
             peer.next -= 1
@@ -278,9 +285,17 @@ class Server(object):
             if self._pool.majority(len(self.votes)):
                 self.to_leader()
 
-    def handle_client(self, cmd):
+    def handle_client(self, cmd, transport):
         self._log.add(self.term, cmd)
+        self._pending_clients[(self.term, self._log.index)] = transport
         self.append_entries()
+
+    def return_results(self, results):
+        for result in results:
+            term, index, result = result
+            transport = self._pending_clients.pop((term, index))
+            transport.write(self.encode(result))
+            transport.close()
 
 
 def run(port, ports):

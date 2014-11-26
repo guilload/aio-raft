@@ -12,10 +12,7 @@ class ClientProtocol(asyncio.Protocol):  # TODO factorize duplicate protocols
 
     def data_received(self, data):
         request = self.server.decode(data)
-        response = self.server.handle_client(request)
-
-        if response:
-            self.transport.write(self.server.encode(response))
+        self.server.handle_client(request, self.transport)
 
 
 class PeerProtocol(asyncio.Protocol):
